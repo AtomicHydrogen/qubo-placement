@@ -3,6 +3,6 @@
 ## Course Project Code Repository
 
 ### Team Members
-- Ashwatit Singh (22B1227)
+- Ashwajit Singh (22B1227)
 - Sreekar Reddy (22B1274)
 - Suchet Gopal (22B1814)
