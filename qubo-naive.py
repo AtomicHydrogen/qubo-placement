@@ -90,24 +90,18 @@ class FPGAPlacementQUBO:
         QUBO[:mn, :mn] += Q
         
         # 2. First constraint: λ||Ax - 1_m||²
-        # Expand: λ(x^T A^T A x - 2·1_m^T A x + 1_m^T 1_m)
-        # Since 1_m^T 1_m is constant, we ignore it
         QUBO[:mn, :mn] += lambda_penalty * (self.A.T @ self.A)
-        # Linear term: -2λ·1_m^T A x (convert to quadratic by adding to diagonal)
         linear_term_1 = -2 * lambda_penalty * (np.ones(self.m) @ self.A)
         for i in range(mn):
             QUBO[i, i] += linear_term_1[i]
         
         # 3. Second constraint: μ||Bx - s||²
-        # Expand: μ(x^T B^T B x - 2s^T B x + s^T s)
         QUBO[:mn, :mn] += mu_penalty * (self.B.T @ self.B)
-        # Cross terms: -2μ B x · s
         for i in range(mn):
             for j in range(self.n):
                 QUBO[i, mn + j] += -2 * mu_penalty * self.B[j, i]
                 QUBO[mn + j, i] += -2 * mu_penalty * self.B[j, i]
         
-        # s^T s term (diagonal)
         for j in range(self.n):
             QUBO[mn + j, mn + j] += mu_penalty
         
@@ -116,9 +110,6 @@ class FPGAPlacementQUBO:
     def solve_with_dwave(self, lambda_penalty, mu_penalty, use_sampler=False, num_reads=100):
         """
         Solve QUBO using D-Wave quantum annealer or simulated annealing
-        
-        use_sampler: If True, use actual D-Wave quantum annealer
-                     If False, use classical simulated annealing
         """
         QUBO = self.construct_qubo(lambda_penalty, mu_penalty)
         mn = self.m * self.n
@@ -127,18 +118,18 @@ class FPGAPlacementQUBO:
         bqm = BinaryQuadraticModel.from_numpy_matrix(QUBO)
         
         if use_sampler:
-            print("\n🔮 Using D-Wave Quantum Annealer...")
+            print("\n[QA] Using D-Wave Quantum Annealer...")
             try:
                 sampler = EmbeddingComposite(DWaveSampler())
                 sampleset = sampler.sample(bqm, num_reads=num_reads, 
                                           label='FPGA-Placement-QUBO')
             except Exception as e:
-                print(f"❌ D-Wave connection failed: {e}")
+                print(f"[ERROR] D-Wave connection failed: {e}")
                 print("Falling back to simulated annealing...")
                 use_sampler = False
         
         if not use_sampler:
-            print("\n🖥️  Using Classical Simulated Annealing (Local QA Simulation)...")
+            print("\n[SA] Using Classical Simulated Annealing (Local QA Simulation)...")
             from neal import SimulatedAnnealingSampler
             sampler = SimulatedAnnealingSampler()
             sampleset = sampler.sample(bqm, num_reads=num_reads)
@@ -155,347 +146,6 @@ class FPGAPlacementQUBO:
         X = x_vec.reshape(self.m, self.n)
         
         return X, s_vec, energy, sampleset
-    
-    def analyze_solution_diversity(self, sampleset, top_k=10):
-        """Analyze diversity of solutions from quantum annealing"""
-        mn = self.m * self.n
-        solutions = []
-        energies = []
-        
-        for sample, energy in sampleset.data(['sample', 'energy']):
-            x_vec = np.array([sample[i] for i in range(mn)])
-            X = x_vec.reshape(self.m, self.n)
-            solutions.append(X)
-            energies.append(energy)
-        
-        # Take top k solutions
-        top_k = min(top_k, len(solutions))
-        top_solutions = solutions[:top_k]
-        top_energies = energies[:top_k]
-        
-        print(f"\n📊 Solution Diversity Analysis (top {top_k} solutions):")
-        print(f"   Energy range: [{min(top_energies):.2f}, {max(top_energies):.2f}]")
-        print(f"   Energy spread: {max(top_energies) - min(top_energies):.2f}")
-        
-        # Check uniqueness
-        unique_solutions = []
-        for sol in top_solutions:
-            is_unique = True
-            for unique_sol in unique_solutions:
-                if np.array_equal(sol, unique_sol):
-                    is_unique = False
-                    break
-            if is_unique:
-                unique_solutions.append(sol)
-        
-        print(f"   Unique solutions: {len(unique_solutions)}/{top_k}")
-        
-        return top_solutions, top_energies
-    
-    def penalty_sweep(self, use_sampler=False, num_reads=100, verbose=True):
-        """
-        Automatically find optimal lambda and mu using two-phase approach:
-        Phase 1: Increase penalties until feasible
-        Phase 2: Decrease penalties while maintaining feasibility
-        """
-        print("\n" + "=" * 70)
-        print("AUTOMATIC PENALTY SWEEP")
-        print("=" * 70)
-        
-        # Initialize
-        lambda_val = self.n ** 2  # n^2 = 100
-        mu_val = self.n ** 2
-        
-        print(f"Initial penalties: λ={lambda_val}, μ={mu_val}")
-        
-        # Phase 1: Feasibility
-        print("\n📍 PHASE 1: Finding Feasible Solution")
-        print("-" * 70)
-        
-        phase1_iterations = 0
-        max_phase1_iterations = 20  # Safety limit
-        
-        while phase1_iterations < max_phase1_iterations:
-            phase1_iterations += 1
-            
-            if verbose:
-                print(f"\nIteration {phase1_iterations}: Testing λ={lambda_val:.1f}, μ={mu_val:.1f}")
-            
-            # Solve with current penalties
-            X, s_vec, energy, sampleset = self.solve_with_dwave(
-                lambda_val, mu_val, use_sampler=use_sampler, num_reads=num_reads
-            )
-            
-            results = self.evaluate_solution(X, s_vec)
-            
-            c1_violation = results['constraint1_violation'] > 0.1
-            c2_violation = results['constraint2_violation'] > 0.1
-            
-            if verbose:
-                print(f"   C1 violation: {results['constraint1_violation']:.4f} {'❌' if c1_violation else '✅'}")
-                print(f"   C2 violation: {results['constraint2_violation']:.4f} {'❌' if c2_violation else '✅'}")
-                print(f"   Objective: {results['objective']:.2f}")
-            
-            # Check termination condition
-            if not c1_violation and not c2_violation:
-                print(f"\n✅ Feasible solution found!")
-                break
-            
-            # Update penalties based on violations
-            if c1_violation and c2_violation:
-                lambda_val *= 2
-                mu_val *= 2
-                if verbose:
-                    print(f"   → Both violated: doubling both penalties")
-            elif c1_violation and not c2_violation:
-                lambda_val *= 2
-                if verbose:
-                    print(f"   → C1 violated: doubling λ")
-            elif c2_violation and not c1_violation:
-                mu_val *= 2
-                if verbose:
-                    print(f"   → C2 violated: doubling μ")
-        
-        if phase1_iterations >= max_phase1_iterations:
-            print(f"\n⚠️  Phase 1 reached max iterations. Using last values.")
-        
-        # Store feasible solution
-        old_loss = results['objective']
-        valid_lambda = lambda_val
-        valid_mu = mu_val
-        valid_loss = old_loss
-        X_valid = X.copy()  # Store the Phase 1 solution
-        s_valid = s_vec.copy()
-        
-        print(f"\n📊 Phase 1 Complete:")
-        print(f"   Feasible penalties: λ={valid_lambda:.1f}, μ={valid_mu:.1f}")
-        print(f"   Objective (wirelength): {valid_loss:.2f}")
-        
-        # Phase 2: Stepwise Reduction
-        print("\n📍 PHASE 2: Optimizing While Maintaining Feasibility")
-        print("-" * 70)
-        
-        # Store Phase 1 solution as reference
-        phase1_lambda = valid_lambda
-        phase1_mu = valid_mu
-        phase1_loss = valid_loss
-        
-        # Stage 1: Aggressive reduction (double step each time)
-        print("\n🔻 Stage 2.1: Aggressive Penalty Reduction")
-        print("-" * 70)
-        
-        step = self.m * self.n  # Initial step = mn
-        stage1_iterations = 0
-        max_stage1_iterations = 20
-        
-        while stage1_iterations < max_stage1_iterations:
-            stage1_iterations += 1
-            
-            # Try reducing penalties
-            lambda_trial = valid_lambda - step
-            mu_trial = valid_mu - step
-            
-            # Ensure non-negative
-            lambda_trial = max(1.0, lambda_trial)
-            mu_trial = max(1.0, mu_trial)
-            
-            if verbose:
-                print(f"\nIteration {stage1_iterations}: Testing λ={lambda_trial:.1f}, μ={mu_trial:.1f} (step={step:.1f})")
-            
-            # Solve with trial penalties
-            X, s_vec, energy, sampleset = self.solve_with_dwave(
-                lambda_trial, mu_trial, use_sampler=use_sampler, num_reads=num_reads
-            )
-            
-            results = self.evaluate_solution(X, s_vec)
-            new_loss = results['objective']
-            
-            c1_violation = results['constraint1_violation'] > 0.1
-            c2_violation = results['constraint2_violation'] > 0.1
-            
-            if verbose:
-                print(f"   C1: {results['constraint1_violation']:.4f} {'❌' if c1_violation else '✅'}, "
-                      f"C2: {results['constraint2_violation']:.4f} {'❌' if c2_violation else '✅'}, "
-                      f"Obj: {new_loss:.2f}")
-            
-            # Check for constraint violation
-            if c1_violation or c2_violation:
-                if verbose:
-                    print(f"   ❌ Constraint violated! Breaking aggressive reduction.")
-                break
-            
-            # No violation - accept and double the step
-            valid_lambda = lambda_trial
-            valid_mu = mu_trial
-            valid_loss = new_loss
-            X_valid = X.copy()
-            s_valid = s_vec.copy()
-            
-            step = step * 2  # Double for next iteration
-            
-            if verbose:
-                print(f"   ✅ Accepted! Doubling step to {step:.1f}")
-        
-        print(f"\n📊 Stage 2.1 Complete: λ={valid_lambda:.1f}, μ={valid_mu:.1f}, obj={valid_loss:.2f}")
-        
-        # Stage 2: Recovery (increase violated constraints)
-        print("\n🔺 Stage 2.2: Constraint Recovery")
-        print("-" * 70)
-        
-        # Determine which constraints failed
-        stage2_iterations = 0
-        max_stage2_iterations = 20
-        recovery_step = step / 2  # Start with half the step that caused violation
-        
-        if verbose:
-            print(f"Initial recovery step: {recovery_step:.1f}")
-        
-        while (c1_violation or c2_violation) and stage2_iterations < max_stage2_iterations:
-            stage2_iterations += 1
-            
-            # Increase only the violated constraints
-            if c1_violation and c2_violation:
-                lambda_trial = valid_lambda + recovery_step
-                mu_trial = valid_mu + recovery_step
-                if verbose:
-                    print(f"\nIteration {stage2_iterations}: Both violated. Increasing both by {recovery_step:.1f}")
-            elif c1_violation:
-                lambda_trial = valid_lambda + recovery_step
-                mu_trial = valid_mu
-                if verbose:
-                    print(f"\nIteration {stage2_iterations}: C1 violated. Increasing λ by {recovery_step:.1f}")
-            else:  # c2_violation
-                lambda_trial = valid_lambda
-                mu_trial = valid_mu + recovery_step
-                if verbose:
-                    print(f"\nIteration {stage2_iterations}: C2 violated. Increasing μ by {recovery_step:.1f}")
-            
-            if verbose:
-                print(f"   Testing λ={lambda_trial:.1f}, μ={mu_trial:.1f}")
-            
-            # Solve with trial penalties
-            X, s_vec, energy, sampleset = self.solve_with_dwave(
-                lambda_trial, mu_trial, use_sampler=use_sampler, num_reads=num_reads
-            )
-            
-            results = self.evaluate_solution(X, s_vec)
-            new_loss = results['objective']
-            
-            c1_violation = results['constraint1_violation'] > 0.1
-            c2_violation = results['constraint2_violation'] > 0.1
-            
-            if verbose:
-                print(f"   C1: {results['constraint1_violation']:.4f} {'❌' if c1_violation else '✅'}, "
-                      f"C2: {results['constraint2_violation']:.4f} {'❌' if c2_violation else '✅'}, "
-                      f"Obj: {new_loss:.2f}")
-            
-            if not c1_violation and not c2_violation:
-                # Recovered! Accept this solution
-                valid_lambda = lambda_trial
-                valid_mu = mu_trial
-                valid_loss = new_loss
-                X_valid = X.copy()
-                s_valid = s_vec.copy()
-                if verbose:
-                    print(f"   ✅ Constraints satisfied! Recovery complete.")
-                break
-            else:
-                # Still violated, double the recovery step
-                recovery_step = recovery_step * 2
-                if verbose:
-                    print(f"   ❌ Still violated. Doubling recovery step to {recovery_step:.1f}")
-        
-        if stage2_iterations >= max_stage2_iterations:
-            print(f"\n⚠️  Stage 2.2 reached max iterations.")
-        else:
-            print(f"\n📊 Stage 2.2 Complete: λ={valid_lambda:.1f}, μ={valid_mu:.1f}, obj={valid_loss:.2f}")
-        
-        # Store recovery point
-        recovery_lambda = valid_lambda
-        recovery_mu = valid_mu
-        recovery_loss = valid_loss
-        
-        # Stage 3: Linear sweep between Phase 1 and Recovery point
-        print("\n🎯 Stage 2.3: Linear Sweep Between Phase 1 and Recovery Point")
-        print("-" * 70)
-        print(f"   Phase 1 point: λ={phase1_lambda:.1f}, μ={phase1_mu:.1f}, obj={phase1_loss:.2f}")
-        print(f"   Recovery point: λ={recovery_lambda:.1f}, μ={recovery_mu:.1f}, obj={recovery_loss:.2f}")
-        
-        # Number of points to sample in the sweep
-        num_sweep_points = 10
-        
-        best_sweep_lambda = valid_lambda
-        best_sweep_mu = valid_mu
-        best_sweep_loss = valid_loss
-        best_sweep_X = X_valid.copy()
-        best_sweep_s = s_valid.copy()
-        
-        for i in range(num_sweep_points + 1):
-            alpha = i / num_sweep_points  # 0 to 1
-            
-            # Linear interpolation between recovery (alpha=0) and phase1 (alpha=1)
-            lambda_trial = recovery_lambda + alpha * (phase1_lambda - recovery_lambda)
-            mu_trial = recovery_mu + alpha * (phase1_mu - recovery_mu)
-            
-            if verbose:
-                print(f"\nSweep point {i}/{num_sweep_points} (α={alpha:.2f}): λ={lambda_trial:.1f}, μ={mu_trial:.1f}")
-            
-            # Solve with trial penalties
-            X, s_vec, energy, sampleset = self.solve_with_dwave(
-                lambda_trial, mu_trial, use_sampler=use_sampler, num_reads=num_reads
-            )
-            
-            results = self.evaluate_solution(X, s_vec)
-            new_loss = results['objective']
-            
-            c1_violation = results['constraint1_violation'] > 0.1
-            c2_violation = results['constraint2_violation'] > 0.1
-            
-            if verbose:
-                print(f"   C1: {results['constraint1_violation']:.4f} {'❌' if c1_violation else '✅'}, "
-                      f"C2: {results['constraint2_violation']:.4f} {'❌' if c2_violation else '✅'}, "
-                      f"Obj: {new_loss:.2f}")
-            
-            # Check if this is better and valid
-            if not c1_violation and not c2_violation:
-                if new_loss < best_sweep_loss:
-                    best_sweep_lambda = lambda_trial
-                    best_sweep_mu = mu_trial
-                    best_sweep_loss = new_loss
-                    best_sweep_X = X.copy()
-                    best_sweep_s = s_vec.copy()
-                    if verbose:
-                        print(f"   ✅ New best! obj={new_loss:.2f}")
-            else:
-                if verbose:
-                    print(f"   ❌ Constraint violated, skipping")
-        
-        # Use best from sweep
-        valid_lambda = best_sweep_lambda
-        valid_mu = best_sweep_mu
-        valid_loss = best_sweep_loss
-        X_valid = best_sweep_X
-        s_valid = best_sweep_s
-        
-        print(f"\n📊 Stage 2.3 Complete")
-        print(f"   Best from sweep: λ={valid_lambda:.1f}, μ={valid_mu:.1f}, obj={valid_loss:.2f}")
-        print(f"\n📊 Phase 2 Complete (Total: {stage1_iterations + stage2_iterations + num_sweep_points + 1} evaluations)")
-        
-        # Final solution is the best valid one we found
-        final_lambda = valid_lambda
-        final_mu = valid_mu
-        final_loss = valid_loss
-        
-        print(f"\n✅ Optimal solution found!")
-        print("\n" + "=" * 70)
-        print("SWEEP RESULTS")
-        print("=" * 70)
-        print(f"Optimal penalties: λ={final_lambda:.1f}, μ={final_mu:.1f}")
-        print(f"Objective (wirelength): {final_loss:.2f}")
-        print("=" * 70)
-        
-        # Return the stored valid solution (don't resolve)
-        return final_lambda, final_mu, X_valid, s_valid, final_loss
     
     def evaluate_solution(self, X, s_vec):
         """Evaluate the quality of a solution"""
@@ -545,7 +195,6 @@ class FPGAPlacementQUBO:
                     overlaps[loc].append(i)
                 else:
                     if loc in placement.values():
-                        # Found overlap - move existing block to overlaps
                         existing_block = [k for k, v in placement.items() if v == loc][0]
                         overlaps[loc] = [existing_block, i]
                         del placement[existing_block]
@@ -558,14 +207,14 @@ class FPGAPlacementQUBO:
         ax.set_xlim(-0.5, self.grid_size - 0.5)
         ax.set_ylim(-0.5, self.grid_size - 0.5)
         ax.set_aspect('equal')
-        ax.invert_yaxis()  # Origin at top-left
+        ax.invert_yaxis()
         
         # Draw grid lines
         for i in range(self.grid_size + 1):
             ax.axhline(i - 0.5, color='gray', linewidth=0.5, alpha=0.5)
             ax.axvline(i - 0.5, color='gray', linewidth=0.5, alpha=0.5)
         
-        # Draw connections first (so they appear behind blocks)
+        # Draw connections
         all_blocks = {**placement}
         for loc, blocks in overlaps.items():
             for block in blocks:
@@ -574,7 +223,6 @@ class FPGAPlacementQUBO:
         for i in range(self.m):
             for j in range(i+1, self.m):
                 if self.F[i, j] > 0 and i in all_blocks and j in all_blocks:
-                    # Get positions
                     loc_i = all_blocks[i]
                     loc_j = all_blocks[j]
                     x_i = loc_i % self.grid_size
@@ -582,162 +230,859 @@ class FPGAPlacementQUBO:
                     x_j = loc_j % self.grid_size
                     y_j = loc_j // self.grid_size
                     
-                    # Draw connection line
                     ax.plot([x_i, x_j], [y_i, y_j], 
                            color='steelblue', linewidth=2, alpha=0.6, zorder=1)
         
-        # Draw blocks as circles with labels (normal placements)
+        # Draw blocks
         for block, loc in placement.items():
             x = loc % self.grid_size
             y = loc // self.grid_size
             
-            # Draw circle
             circle = plt.Circle((x, y), 0.35, color='lightcoral', 
                               ec='darkred', linewidth=2, zorder=2)
             ax.add_patch(circle)
             
-            # Add label
             ax.text(x, y, str(block), ha='center', va='center',
                    fontsize=12, fontweight='bold', color='white', zorder=3)
         
-        # Draw overlapping blocks (WARNING: multiple blocks at same location!)
+        # Draw overlaps
         for loc, blocks in overlaps.items():
             x = loc % self.grid_size
             y = loc // self.grid_size
             
-            # Draw larger circle in red to indicate problem
             circle = plt.Circle((x, y), 0.4, color='red', 
                               ec='darkred', linewidth=3, zorder=2)
             ax.add_patch(circle)
             
-            # Add label showing all blocks at this location
             label = ','.join(map(str, blocks))
             ax.text(x, y, label, ha='center', va='center',
                    fontsize=10, fontweight='bold', color='white', zorder=3)
             
-            # Add warning annotation
             ax.annotate('OVERLAP!', xy=(x, y), xytext=(x+0.6, y+0.6),
                        fontsize=8, color='red', fontweight='bold',
                        arrowprops=dict(arrowstyle='->', color='red', lw=2))
         
-        # Labels and title
         ax.set_xlabel('X coordinate', fontsize=12)
         ax.set_ylabel('Y coordinate', fontsize=12)
         
-        # Update title to show overlaps
         if overlaps:
-            title += f" ⚠️ {len(overlaps)} OVERLAPS DETECTED!"
+            title += f" [WARNING] {len(overlaps)} OVERLAPS DETECTED!"
         ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
         
-        # Set integer ticks
         ax.set_xticks(range(self.grid_size))
         ax.set_yticks(range(self.grid_size))
         
-        # Add grid coordinates at each position
+        # Add grid coordinates
         occupied_locs = set(placement.values()) | set(overlaps.keys())
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 loc_id = i * self.grid_size + j
-                # Only show if no block placed here
                 if loc_id not in occupied_locs:
                     ax.text(j, i, f'{loc_id}', ha='center', va='center',
                            fontsize=7, color='gray', alpha=0.4, zorder=0)
         
         plt.tight_layout()
         
-        # Save or show
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"💾 Visualization saved to: {save_path}")
+            print(f"[SAVE] Visualization saved to: {save_path}")
             plt.close(fig)
         
         return fig
+    
+    def visualize_objective_progression(self, sweep_history, save_path=None):
+        """Create a detailed standalone visualization of objective progression"""
+        fig, ax = plt.subplots(1, 1, figsize=(14, 8))
+        
+        objectives = np.array(sweep_history['objective'])
+        valid = np.array(sweep_history['valid'])
+        phases = sweep_history['phase']
+        iterations = np.arange(len(objectives))
+        
+        # Color map for phases
+        phase_colors = {
+            'phase1': 'red',
+            'stage2.1': 'orange',
+            'stage2.2': 'yellow',
+            'stage2.3': 'green'
+        }
+        colors = [phase_colors.get(p, 'gray') for p in phases]
+        
+        # Plot valid solutions
+        valid_mask = valid == True
+        invalid_mask = valid == False
+        
+        ax.scatter(iterations[valid_mask], objectives[valid_mask], 
+                  c=np.array(colors)[valid_mask], s=100, alpha=0.8, 
+                  edgecolors='darkgreen', linewidths=2, label='Valid', zorder=3)
+        ax.scatter(iterations[invalid_mask], objectives[invalid_mask], 
+                  c=np.array(colors)[invalid_mask], s=100, alpha=0.6, 
+                  marker='x', linewidths=2, label='Invalid', zorder=2)
+        
+        # Connect with line
+        ax.plot(iterations, objectives, 'k-', alpha=0.3, linewidth=1.5, zorder=1)
+        
+        # Highlight best solution
+        if np.any(valid_mask):
+            best_idx = np.where(valid_mask)[0][np.argmin(objectives[valid_mask])]
+            ax.scatter(best_idx, objectives[best_idx], 
+                      c='purple', s=400, marker='*', 
+                      edgecolors='black', linewidths=3, 
+                      label='Best Solution', zorder=10)
+            ax.annotate(f'Best: {objectives[best_idx]:.2f}', 
+                       xy=(best_idx, objectives[best_idx]),
+                       xytext=(best_idx + 2, objectives[best_idx] * 1.1),
+                       fontsize=12, fontweight='bold',
+                       arrowprops=dict(arrowstyle='->', lw=2, color='purple'))
+        
+        # Mark phase boundaries
+        phase_changes = [0]
+        current_phase = phases[0]
+        for i, phase in enumerate(phases[1:], 1):
+            if phase != current_phase:
+                phase_changes.append(i)
+                current_phase = phase
+        phase_changes.append(len(phases))
+        
+        for i in range(len(phase_changes) - 1):
+            start_idx = phase_changes[i]
+            end_idx = phase_changes[i + 1]
+            phase_name = phases[start_idx]
+            mid_idx = (start_idx + end_idx) // 2
+            
+            ax.axvspan(start_idx, end_idx, alpha=0.1, 
+                      color=phase_colors.get(phase_name, 'gray'))
+            
+            # Label phase
+            phase_labels = {
+                'phase1': 'Phase 1:\nFeasibility',
+                'stage2.1': 'Stage 2.1:\nAggressive\nReduction',
+                'stage2.2': 'Stage 2.2:\nRecovery',
+                'stage2.3': 'Stage 2.3:\nLinear Sweep'
+            }
+            ax.text(mid_idx, ax.get_ylim()[1] * 0.95, 
+                   phase_labels.get(phase_name, phase_name),
+                   ha='center', va='top', fontsize=10, 
+                   bbox=dict(boxstyle='round', facecolor=phase_colors.get(phase_name, 'gray'), alpha=0.3))
+        
+        ax.set_xlabel('Iteration', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Objective (Wirelength)', fontsize=14, fontweight='bold')
+        ax.set_title('Objective Function Progression During Penalty Sweep', 
+                    fontsize=16, fontweight='bold', pad=20)
+        ax.legend(loc='upper right', fontsize=11)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"[SAVE] Objective progression saved to: {save_path}")
+            plt.close(fig)
+        
+        return fig
+    
+    def visualize_placement_progression(self, sweep_history, save_path=None, num_snapshots=6):
+        """Visualize how placement evolves during the sweep"""
+        placements = sweep_history['X']
+        phases = sweep_history['phase']
+        objectives = sweep_history['objective']
+        valid = sweep_history['valid']
+        lambdas = sweep_history['lambda']
+        mus = sweep_history['mu']
+        
+        # Select key snapshots to show
+        total_iters = len(placements)
+        
+        # Strategy: show first, last, best, and evenly spaced others
+        snapshot_indices = []
+        
+        # First iteration
+        snapshot_indices.append(0)
+        
+        # Best valid solution
+        valid_array = np.array(valid)
+        if np.any(valid_array):
+            best_idx = np.where(valid_array)[0][np.argmin(np.array(objectives)[valid_array])]
+            snapshot_indices.append(best_idx)
+        
+        # Last iteration
+        snapshot_indices.append(total_iters - 1)
+        
+        # Fill remaining with evenly spaced
+        remaining = num_snapshots - len(snapshot_indices)
+        if remaining > 0:
+            step = total_iters // (remaining + 1)
+            for i in range(1, remaining + 1):
+                idx = min(i * step, total_iters - 1)
+                if idx not in snapshot_indices:
+                    snapshot_indices.append(idx)
+        
+        # Sort and limit
+        snapshot_indices = sorted(list(set(snapshot_indices)))[:num_snapshots]
+        
+        # Create subplot grid
+        n_cols = 3
+        n_rows = (len(snapshot_indices) + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        axes = axes.flatten()
+        
+        for plot_idx, iter_idx in enumerate(snapshot_indices):
+            ax = axes[plot_idx]
+            X = placements[iter_idx]
+            
+            # Extract placement
+            placement = {}
+            overlaps = {}
+            for i in range(self.m):
+                locations = np.where(X[i, :] == 1)[0]
+                if len(locations) > 0:
+                    loc = locations[0]
+                    if loc in overlaps:
+                        overlaps[loc].append(i)
+                    else:
+                        if loc in placement.values():
+                            existing_block = [k for k, v in placement.items() if v == loc][0]
+                            overlaps[loc] = [existing_block, i]
+                            del placement[existing_block]
+                        else:
+                            placement[i] = loc
+            
+            # Draw grid
+            ax.set_xlim(-0.5, self.grid_size - 0.5)
+            ax.set_ylim(-0.5, self.grid_size - 0.5)
+            ax.set_aspect('equal')
+            ax.invert_yaxis()
+            
+            for i in range(self.grid_size + 1):
+                ax.axhline(i - 0.5, color='gray', linewidth=0.5, alpha=0.3)
+                ax.axvline(i - 0.5, color='gray', linewidth=0.5, alpha=0.3)
+            
+            # Draw connections
+            all_blocks = {**placement}
+            for loc, blocks in overlaps.items():
+                for block in blocks:
+                    all_blocks[block] = loc
+            
+            for i in range(self.m):
+                for j in range(i+1, self.m):
+                    if self.F[i, j] > 0 and i in all_blocks and j in all_blocks:
+                        loc_i = all_blocks[i]
+                        loc_j = all_blocks[j]
+                        x_i = loc_i % self.grid_size
+                        y_i = loc_i // self.grid_size
+                        x_j = loc_j % self.grid_size
+                        y_j = loc_j // self.grid_size
+                        ax.plot([x_i, x_j], [y_i, y_j], 
+                               color='steelblue', linewidth=1.5, alpha=0.4, zorder=1)
+            
+            # Draw blocks
+            for block, loc in placement.items():
+                x = loc % self.grid_size
+                y = loc // self.grid_size
+                circle = plt.Circle((x, y), 0.3, color='lightcoral', 
+                                  ec='darkred', linewidth=1.5, zorder=2)
+                ax.add_patch(circle)
+                ax.text(x, y, str(block), ha='center', va='center',
+                       fontsize=9, fontweight='bold', color='white', zorder=3)
+            
+            # Draw overlaps
+            for loc, blocks in overlaps.items():
+                x = loc % self.grid_size
+                y = loc // self.grid_size
+                circle = plt.Circle((x, y), 0.35, color='red', 
+                                  ec='darkred', linewidth=2, zorder=2)
+                ax.add_patch(circle)
+                label = ','.join(map(str, blocks))
+                ax.text(x, y, label, ha='center', va='center',
+                       fontsize=8, fontweight='bold', color='white', zorder=3)
+            
+            # Title with info
+            phase_name = phases[iter_idx]
+            is_valid = valid[iter_idx]
+            obj_val = objectives[iter_idx]
+            lambda_val = lambdas[iter_idx]
+            mu_val = mus[iter_idx]
+            
+            title = f"Iter {iter_idx}: {phase_name}\n"
+            title += f"lambda={lambda_val:.0f}, mu={mu_val:.0f}\n"
+            title += f"Obj={obj_val:.1f} {'[OK]' if is_valid else '[X]'}"
+            
+            if iter_idx == 0:
+                title = "[START] " + title
+            elif iter_idx == total_iters - 1:
+                title = "[FINAL] " + title
+            elif iter_idx == best_idx and is_valid:
+                title = "[BEST] " + title
+            
+            ax.set_title(title, fontsize=10, fontweight='bold')
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        # Hide unused subplots
+        for idx in range(len(snapshot_indices), len(axes)):
+            axes[idx].axis('off')
+        
+        plt.suptitle('Placement Evolution During Penalty Sweep', 
+                    fontsize=16, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"[SAVE] Placement progression saved to: {save_path}")
+            plt.close(fig)
+        
+        return fig
+    
+    def visualize_sweep_progress(self, sweep_history, save_path=None):
+        """Visualize the penalty sweep algorithm progression"""
+        fig = plt.figure(figsize=(16, 10))
+        gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+        
+        # Extract data
+        lambdas = np.array(sweep_history['lambda'])
+        mus = np.array(sweep_history['mu'])
+        objectives = np.array(sweep_history['objective'])
+        c1_viols = np.array(sweep_history['c1_violation'])
+        c2_viols = np.array(sweep_history['c2_violation'])
+        valid = np.array(sweep_history['valid'])
+        phases = sweep_history['phase']
+        
+        iterations = np.arange(len(lambdas))
+        
+        # Color map for phases
+        phase_colors = {
+            'phase1': 'red',
+            'stage2.1': 'orange',
+            'stage2.2': 'yellow',
+            'stage2.3': 'green'
+        }
+        colors = [phase_colors.get(p, 'gray') for p in phases]
+        
+        # Plot 1: Lambda over iterations
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.scatter(iterations, lambdas, c=colors, s=50, alpha=0.7)
+        ax1.plot(iterations, lambdas, 'k-', alpha=0.3, linewidth=1)
+        ax1.set_xlabel('Iteration')
+        ax1.set_ylabel('Lambda Penalty')
+        ax1.set_title('Lambda Evolution')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_yscale('log')
+        
+        # Plot 2: Mu over iterations
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.scatter(iterations, mus, c=colors, s=50, alpha=0.7)
+        ax2.plot(iterations, mus, 'k-', alpha=0.3, linewidth=1)
+        ax2.set_xlabel('Iteration')
+        ax2.set_ylabel('Mu Penalty')
+        ax2.set_title('Mu Evolution')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_yscale('log')
+        
+        # Plot 3: Objective over iterations
+        ax3 = fig.add_subplot(gs[1, 0])
+        ax3.scatter(iterations[valid], objectives[valid], c='green', s=50, alpha=0.7, label='Valid')
+        ax3.scatter(iterations[~valid], objectives[~valid], c='red', s=50, alpha=0.7, label='Invalid')
+        ax3.plot(iterations, objectives, 'k-', alpha=0.3, linewidth=1)
+        ax3.set_xlabel('Iteration')
+        ax3.set_ylabel('Objective (Wirelength)')
+        ax3.set_title('Objective Evolution')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # Plot 4: Constraint violations
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.semilogy(iterations, c1_viols, 'b-', alpha=0.7, label='C1 Violation')
+        ax4.semilogy(iterations, c2_viols, 'r-', alpha=0.7, label='C2 Violation')
+        ax4.axhline(0.1, color='k', linestyle='--', alpha=0.5, label='Threshold')
+        ax4.set_xlabel('Iteration')
+        ax4.set_ylabel('Constraint Violation')
+        ax4.set_title('Constraint Violations')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
+        # Plot 5: Lambda vs Mu trajectory
+        ax5 = fig.add_subplot(gs[2, 0])
+        for i in range(len(lambdas)-1):
+            ax5.plot(lambdas[i:i+2], mus[i:i+2], c=colors[i], alpha=0.7, linewidth=2)
+        ax5.scatter(lambdas[valid], mus[valid], c='green', s=100, marker='o', 
+                   edgecolors='black', linewidths=2, alpha=0.7, label='Valid', zorder=5)
+        ax5.scatter(lambdas[~valid], mus[~valid], c='red', s=100, marker='x', 
+                   linewidths=2, alpha=0.7, label='Invalid', zorder=5)
+        ax5.scatter(lambdas[0], mus[0], c='blue', s=200, marker='s', 
+                   edgecolors='black', linewidths=2, label='Start', zorder=10)
+        ax5.scatter(lambdas[-1], mus[-1], c='purple', s=200, marker='*', 
+                   edgecolors='black', linewidths=2, label='Final', zorder=10)
+        ax5.set_xlabel('Lambda')
+        ax5.set_ylabel('Mu')
+        ax5.set_title('Penalty Space Trajectory')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
+        ax5.set_xscale('log')
+        ax5.set_yscale('log')
+        
+        # Plot 6: Phase legend and statistics
+        ax6 = fig.add_subplot(gs[2, 1])
+        ax6.axis('off')
+        
+        # Phase legend
+        legend_text = "Phase Legend:\n"
+        legend_text += "  Phase 1 (red): Initial feasibility search\n"
+        legend_text += "  Stage 2.1 (orange): Aggressive reduction\n"
+        legend_text += "  Stage 2.2 (yellow): Constraint recovery\n"
+        legend_text += "  Stage 2.3 (green): Linear sweep optimization\n\n"
+        
+        # Statistics
+        best_valid_idx = np.where(valid)[0]
+        if len(best_valid_idx) > 0:
+            best_idx = best_valid_idx[np.argmin(objectives[best_valid_idx])]
+            legend_text += f"Best Solution:\n"
+            legend_text += f"  Iteration: {best_idx}\n"
+            legend_text += f"  Lambda: {lambdas[best_idx]:.1f}\n"
+            legend_text += f"  Mu: {mus[best_idx]:.1f}\n"
+            legend_text += f"  Objective: {objectives[best_idx]:.2f}\n"
+            legend_text += f"  C1 Violation: {c1_viols[best_idx]:.4f}\n"
+            legend_text += f"  C2 Violation: {c2_viols[best_idx]:.4f}\n\n"
+        
+        legend_text += f"Total Iterations: {len(lambdas)}\n"
+        legend_text += f"Valid Solutions: {np.sum(valid)}/{len(valid)}"
+        
+        ax6.text(0.1, 0.5, legend_text, fontsize=11, family='monospace',
+                verticalalignment='center')
+        
+        plt.suptitle('Penalty Sweep Algorithm Progression', fontsize=16, fontweight='bold')
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"[SAVE] Progression visualization saved to: {save_path}")
+            plt.close(fig)
+        
+        return fig
+    
+    def penalty_sweep(self, use_sampler=False, num_reads=100, verbose=True):
+        """
+        Automatically find optimal lambda and mu using two-phase approach
+        """
+        print("\n" + "=" * 70)
+        print("AUTOMATIC PENALTY SWEEP")
+        print("=" * 70)
+        
+        # Track all evaluations for visualization
+        sweep_history = {
+            'lambda': [],
+            'mu': [],
+            'objective': [],
+            'c1_violation': [],
+            'c2_violation': [],
+            'valid': [],
+            'phase': [],
+            'X': [],  # Store placement matrices
+            's': []   # Store slack variables
+        }
+        
+        lambda_val = self.n ** 2
+        mu_val = self.n ** 2
+        
+        print(f"Initial penalties: lambda={lambda_val}, mu={mu_val}")
+        
+        # Phase 1: Feasibility
+        print("\n[PHASE 1] Finding Feasible Solution")
+        print("-" * 70)
+        
+        phase1_iterations = 0
+        max_phase1_iterations = 20
+        
+        while phase1_iterations < max_phase1_iterations:
+            phase1_iterations += 1
+            
+            if verbose:
+                print(f"\nIteration {phase1_iterations}: Testing lambda={lambda_val:.1f}, mu={mu_val:.1f}")
+            
+            X, s_vec, energy, sampleset = self.solve_with_dwave(
+                lambda_val, mu_val, use_sampler=use_sampler, num_reads=num_reads
+            )
+            
+            results = self.evaluate_solution(X, s_vec)
+            
+            c1_violation = results['constraint1_violation'] > 0.1
+            c2_violation = results['constraint2_violation'] > 0.1
+            
+            # Record history
+            sweep_history['lambda'].append(lambda_val)
+            sweep_history['mu'].append(mu_val)
+            sweep_history['objective'].append(results['objective'])
+            sweep_history['c1_violation'].append(results['constraint1_violation'])
+            sweep_history['c2_violation'].append(results['constraint2_violation'])
+            sweep_history['valid'].append(not (c1_violation or c2_violation))
+            sweep_history['phase'].append('phase1')
+            sweep_history['X'].append(X.copy())
+            sweep_history['s'].append(s_vec.copy())
+            
+            if verbose:
+                print(f"   C1 violation: {results['constraint1_violation']:.4f} {'[X]' if c1_violation else '[OK]'}")
+                print(f"   C2 violation: {results['constraint2_violation']:.4f} {'[X]' if c2_violation else '[OK]'}")
+                print(f"   Objective: {results['objective']:.2f}")
+            
+            if not c1_violation and not c2_violation:
+                print(f"\n[OK] Feasible solution found!")
+                break
+            
+            if c1_violation and c2_violation:
+                lambda_val *= 2
+                mu_val *= 2
+                if verbose:
+                    print(f"   -> Both violated: doubling both penalties")
+            elif c1_violation and not c2_violation:
+                lambda_val *= 2
+                if verbose:
+                    print(f"   -> C1 violated: doubling lambda")
+            elif c2_violation and not c1_violation:
+                mu_val *= 2
+                if verbose:
+                    print(f"   -> C2 violated: doubling mu")
+        
+        if phase1_iterations >= max_phase1_iterations:
+            print(f"\n[WARNING] Phase 1 reached max iterations. Using last values.")
+        
+        # Store Phase 1 solution
+        old_loss = results['objective']
+        valid_lambda = lambda_val
+        valid_mu = mu_val
+        valid_loss = old_loss
+        X_valid = X.copy()
+        s_valid = s_vec.copy()
+        phase1_lambda = valid_lambda
+        phase1_mu = valid_mu
+        phase1_loss = valid_loss
+        
+        print(f"\n[PHASE 1 COMPLETE]")
+        print(f"   Feasible penalties: lambda={valid_lambda:.1f}, mu={valid_mu:.1f}")
+        print(f"   Objective (wirelength): {valid_loss:.2f}")
+        
+        # Phase 2: Stage 2.1 - Aggressive reduction
+        print("\n[STAGE 2.1] Aggressive Penalty Reduction")
+        print("-" * 70)
+        
+        step = self.m * self.n
+        stage1_iterations = 0
+        max_stage1_iterations = 20
+        
+        while stage1_iterations < max_stage1_iterations:
+            stage1_iterations += 1
+            
+            lambda_trial = valid_lambda - step
+            mu_trial = valid_mu - step
+            
+            lambda_trial = max(1.0, lambda_trial)
+            mu_trial = max(1.0, mu_trial)
+            
+            if verbose:
+                print(f"\nIteration {stage1_iterations}: Testing lambda={lambda_trial:.1f}, mu={mu_trial:.1f} (step={step:.1f})")
+            
+            X, s_vec, energy, sampleset = self.solve_with_dwave(
+                lambda_trial, mu_trial, use_sampler=use_sampler, num_reads=num_reads
+            )
+            
+            results = self.evaluate_solution(X, s_vec)
+            new_loss = results['objective']
+            
+            c1_violation = results['constraint1_violation'] > 0.1
+            c2_violation = results['constraint2_violation'] > 0.1
+            
+            # Record history
+            sweep_history['lambda'].append(lambda_trial)
+            sweep_history['mu'].append(mu_trial)
+            sweep_history['objective'].append(new_loss)
+            sweep_history['c1_violation'].append(results['constraint1_violation'])
+            sweep_history['c2_violation'].append(results['constraint2_violation'])
+            sweep_history['valid'].append(not (c1_violation or c2_violation))
+            sweep_history['phase'].append('stage2.1')
+            sweep_history['X'].append(X.copy())
+            sweep_history['s'].append(s_vec.copy())
+            
+            if verbose:
+                print(f"   C1: {results['constraint1_violation']:.4f} {'[X]' if c1_violation else '[OK]'}, "
+                      f"C2: {results['constraint2_violation']:.4f} {'[X]' if c2_violation else '[OK]'}, "
+                      f"Obj: {new_loss:.2f}")
+            
+            if c1_violation or c2_violation:
+                if verbose:
+                    print(f"   [X] Constraint violated! Breaking aggressive reduction.")
+                break
+            
+            valid_lambda = lambda_trial
+            valid_mu = mu_trial
+            valid_loss = new_loss
+            X_valid = X.copy()
+            s_valid = s_vec.copy()
+            
+            step = step * 2
+            
+            if verbose:
+                print(f"   [OK] Accepted! Doubling step to {step:.1f}")
+        
+        print(f"\n[STAGE 2.1 COMPLETE]: lambda={valid_lambda:.1f}, mu={valid_mu:.1f}, obj={valid_loss:.2f}")
+        
+        # Stage 2.2: Recovery
+        print("\n[STAGE 2.2] Constraint Recovery")
+        print("-" * 70)
+        
+        stage2_iterations = 0
+        max_stage2_iterations = 20
+        recovery_step = step / 2
+        
+        if verbose:
+            print(f"Initial recovery step: {recovery_step:.1f}")
+        
+        while (c1_violation or c2_violation) and stage2_iterations < max_stage2_iterations:
+            stage2_iterations += 1
+            
+            if c1_violation and c2_violation:
+                lambda_trial = valid_lambda + recovery_step
+                mu_trial = valid_mu + recovery_step
+                if verbose:
+                    print(f"\nIteration {stage2_iterations}: Both violated. Increasing both by {recovery_step:.1f}")
+            elif c1_violation:
+                lambda_trial = valid_lambda + recovery_step
+                mu_trial = valid_mu
+                if verbose:
+                    print(f"\nIteration {stage2_iterations}: C1 violated. Increasing lambda by {recovery_step:.1f}")
+            else:
+                lambda_trial = valid_lambda
+                mu_trial = valid_mu + recovery_step
+                if verbose:
+                    print(f"\nIteration {stage2_iterations}: C2 violated. Increasing mu by {recovery_step:.1f}")
+            
+            if verbose:
+                print(f"   Testing lambda={lambda_trial:.1f}, mu={mu_trial:.1f}")
+            
+            X, s_vec, energy, sampleset = self.solve_with_dwave(
+                lambda_trial, mu_trial, use_sampler=use_sampler, num_reads=num_reads
+            )
+            
+            results = self.evaluate_solution(X, s_vec)
+            new_loss = results['objective']
+            
+            c1_violation = results['constraint1_violation'] > 0.1
+            c2_violation = results['constraint2_violation'] > 0.1
+            
+            # Record history
+            sweep_history['lambda'].append(lambda_trial)
+            sweep_history['mu'].append(mu_trial)
+            sweep_history['objective'].append(new_loss)
+            sweep_history['c1_violation'].append(results['constraint1_violation'])
+            sweep_history['c2_violation'].append(results['constraint2_violation'])
+            sweep_history['valid'].append(not (c1_violation or c2_violation))
+            sweep_history['phase'].append('stage2.2')
+            sweep_history['X'].append(X.copy())
+            sweep_history['s'].append(s_vec.copy())
+            
+            if verbose:
+                print(f"   C1: {results['constraint1_violation']:.4f} {'[X]' if c1_violation else '[OK]'}, "
+                      f"C2: {results['constraint2_violation']:.4f} {'[X]' if c2_violation else '[OK]'}, "
+                      f"Obj: {new_loss:.2f}")
+            
+            if not c1_violation and not c2_violation:
+                valid_lambda = lambda_trial
+                valid_mu = mu_trial
+                valid_loss = new_loss
+                X_valid = X.copy()
+                s_valid = s_vec.copy()
+                if verbose:
+                    print(f"   [OK] Constraints satisfied! Recovery complete.")
+                break
+            else:
+                recovery_step = recovery_step * 2
+                if verbose:
+                    print(f"   [X] Still violated. Doubling recovery step to {recovery_step:.1f}")
+        
+        if stage2_iterations >= max_stage2_iterations:
+            print(f"\n[WARNING] Stage 2.2 reached max iterations.")
+        else:
+            print(f"\n[STAGE 2.2 COMPLETE]: lambda={valid_lambda:.1f}, mu={valid_mu:.1f}, obj={valid_loss:.2f}")
+        
+        recovery_lambda = valid_lambda
+        recovery_mu = valid_mu
+        recovery_loss = valid_loss
+        
+        # Stage 2.3: Linear sweep
+        print("\n[STAGE 2.3] Linear Sweep Between Phase 1 and Recovery Point")
+        print("-" * 70)
+        print(f"   Phase 1 point: lambda={phase1_lambda:.1f}, mu={phase1_mu:.1f}, obj={phase1_loss:.2f}")
+        print(f"   Recovery point: lambda={recovery_lambda:.1f}, mu={recovery_mu:.1f}, obj={recovery_loss:.2f}")
+        
+        num_sweep_points = 10
+        
+        best_sweep_lambda = valid_lambda
+        best_sweep_mu = valid_mu
+        best_sweep_loss = valid_loss
+        best_sweep_X = X_valid.copy()
+        best_sweep_s = s_valid.copy()
+        
+        for i in range(num_sweep_points + 1):
+            alpha = i / num_sweep_points
+            
+            lambda_trial = recovery_lambda + alpha * (phase1_lambda - recovery_lambda)
+            mu_trial = recovery_mu + alpha * (phase1_mu - recovery_mu)
+            
+            if verbose:
+                print(f"\nSweep point {i}/{num_sweep_points} (alpha={alpha:.2f}): lambda={lambda_trial:.1f}, mu={mu_trial:.1f}")
+            
+            X, s_vec, energy, sampleset = self.solve_with_dwave(
+                lambda_trial, mu_trial, use_sampler=use_sampler, num_reads=num_reads
+            )
+            
+            results = self.evaluate_solution(X, s_vec)
+            new_loss = results['objective']
+            
+            c1_violation = results['constraint1_violation'] > 0.1
+            c2_violation = results['constraint2_violation'] > 0.1
+            
+            # Record history
+            sweep_history['lambda'].append(lambda_trial)
+            sweep_history['mu'].append(mu_trial)
+            sweep_history['objective'].append(new_loss)
+            sweep_history['c1_violation'].append(results['constraint1_violation'])
+            sweep_history['c2_violation'].append(results['constraint2_violation'])
+            sweep_history['valid'].append(not (c1_violation or c2_violation))
+            sweep_history['phase'].append('stage2.3')
+            sweep_history['X'].append(X.copy())
+            sweep_history['s'].append(s_vec.copy())
+            
+            if verbose:
+                print(f"   C1: {results['constraint1_violation']:.4f} {'[X]' if c1_violation else '[OK]'}, "
+                      f"C2: {results['constraint2_violation']:.4f} {'[X]' if c2_violation else '[OK]'}, "
+                      f"Obj: {new_loss:.2f}")
+            
+            if not c1_violation and not c2_violation:
+                if new_loss < best_sweep_loss:
+                    best_sweep_lambda = lambda_trial
+                    best_sweep_mu = mu_trial
+                    best_sweep_loss = new_loss
+                    best_sweep_X = X.copy()
+                    best_sweep_s = s_vec.copy()
+                    if verbose:
+                        print(f"   [OK] New best! obj={new_loss:.2f}")
+            else:
+                if verbose:
+                    print(f"   [X] Constraint violated, skipping")
+        
+        valid_lambda = best_sweep_lambda
+        valid_mu = best_sweep_mu
+        valid_loss = best_sweep_loss
+        X_valid = best_sweep_X
+        s_valid = best_sweep_s
+        
+        print(f"\n[STAGE 2.3 COMPLETE]")
+        print(f"   Best from sweep: lambda={valid_lambda:.1f}, mu={valid_mu:.1f}, obj={valid_loss:.2f}")
+        print(f"\n[PHASE 2 COMPLETE] Total evaluations: {phase1_iterations + stage1_iterations + stage2_iterations + num_sweep_points + 1}")
+        
+        final_lambda = valid_lambda
+        final_mu = valid_mu
+        final_loss = valid_loss
+        
+        print(f"\n[SUCCESS] Optimal solution found!")
+        print("\n" + "=" * 70)
+        print("SWEEP RESULTS")
+        print("=" * 70)
+        print(f"Optimal penalties: lambda={final_lambda:.1f}, mu={final_mu:.1f}")
+        print(f"Objective (wirelength): {final_loss:.2f}")
+        print("=" * 70)
+        
+        return final_lambda, final_mu, X_valid, s_valid, final_loss, sweep_history
 
 
-# Example usage and parameter tuning interface
+# Main function
 def main():
     print("=" * 60)
     print("FPGA PLACEMENT using QUBO Formulation (Section 4.1)")
     print("=" * 60)
     
-    # Problem setup
-    m = 10   # Number of blocks to place
-    n = 25  # Number of grid locations (10x10)
+    m = 10
+    n = 25
     
     placer = FPGAPlacementQUBO(m, n, grid_size=10)
     
-    # Display flow matrix
-    print("\n📊 Flow Matrix (connectivity between blocks):")
+    print("\n[INFO] Flow Matrix (connectivity between blocks):")
     print(placer.F)
     
-    # Parameter tuning guide
     print("\n" + "=" * 60)
     print("PARAMETER TUNING GUIDE")
     print("=" * 60)
     print("Start with small values and increase gradually:")
-    print("  λ (lambda): Controls 'each block placed exactly once' constraint")
-    print("  μ (mu):     Controls 'at most one block per location' constraint")
-    print("\nSuggested starting values: λ=100, μ=100")
+    print("  lambda (lambda): Controls 'each block placed exactly once' constraint")
+    print("  mu (mu):     Controls 'at most one block per location' constraint")
+    print("\nSuggested starting values: lambda=100, mu=100")
     print("If constraints violated, increase penalties by 5-10x")
     print("If valid but poor objective, try decreasing slightly")
     print("=" * 60)
     
-    # Interactive or batch mode
-    mode = input("\nSelect mode:\n  1) Auto sweep (find optimal λ,μ automatically)\n  2) Manual single run\n  3) Batch mode (try multiple values)\nChoice [default=1]: ") or "1"
+    mode = input("\nSelect mode:\n  1) Auto sweep (find optimal lambda,mu automatically)\n  2) Manual single run\n  3) Batch mode (try multiple values)\nChoice [default=1]: ") or "1"
     
     if mode == "1":
-        # Automatic penalty sweep
         use_dwave = input("Use D-Wave quantum annealer? (y/n) [default=n]: ").lower() == 'y'
         verbose = input("Verbose output? (y/n) [default=y]: ").lower() != 'n'
         
-        optimal_lambda, optimal_mu, X, s_vec, final_loss = placer.penalty_sweep(
+        optimal_lambda, optimal_mu, X, s_vec, final_loss, sweep_history = placer.penalty_sweep(
             use_sampler=use_dwave,
             num_reads=100,
             verbose=verbose
         )
         
-        # Evaluate final solution
         results = placer.evaluate_solution(X, s_vec)
         
         print("\n" + "=" * 60)
         print("FINAL SOLUTION")
         print("=" * 60)
-        print(f"✅ Valid Placement: {results['is_valid_placement']}")
-        print(f"📏 Objective (wirelength): {results['objective']:.2f}")
-        print(f"⚠️  Constraint 1 violation: {results['constraint1_violation']:.4f}")
-        print(f"⚠️  Constraint 2 violation: {results['constraint2_violation']:.4f}")
+        print(f"[INFO] Valid Placement: {results['is_valid_placement']}")
+        print(f"[INFO] Objective (wirelength): {results['objective']:.2f}")
+        print(f"[INFO] Constraint 1 violation: {results['constraint1_violation']:.4f}")
+        print(f"[INFO] Constraint 2 violation: {results['constraint2_violation']:.4f}")
         
         if len(results['blocks_not_placed_once']) > 0:
-            print(f"\n❌ Blocks not placed exactly once: {results['blocks_not_placed_once'].tolist()}")
+            print(f"\n[ERROR] Blocks not placed exactly once: {results['blocks_not_placed_once'].tolist()}")
         
         if len(results['locations_with_overlap']) > 0:
-            print(f"\n❌ Locations with overlapping blocks: {results['locations_with_overlap'].tolist()}")
+            print(f"\n[ERROR] Locations with overlapping blocks: {results['locations_with_overlap'].tolist()}")
         
-        # Visualize
         output_dir = "fpga_placement_results"
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"placement_optimal_lambda{optimal_lambda:.0f}_mu{optimal_mu:.0f}.png")
         
+        # Save placement visualization
+        output_file = os.path.join(output_dir, f"placement_optimal_lambda{optimal_lambda:.0f}_mu{optimal_mu:.0f}.png")
         placer.visualize_placement(
             X, 
-            title=f"Optimal: λ={optimal_lambda:.1f}, μ={optimal_mu:.1f}, Valid={results['is_valid_placement']}",
+            title=f"Optimal: lambda={optimal_lambda:.1f}, mu={optimal_mu:.1f}, Valid={results['is_valid_placement']}",
             save_path=output_file
         )
         
-        print(f"\n📁 Results saved to: {output_dir}/")
+        # Save progression visualization
+        progress_file = os.path.join(output_dir, f"sweep_progression_lambda{optimal_lambda:.0f}_mu{optimal_mu:.0f}.png")
+        placer.visualize_sweep_progress(sweep_history, save_path=progress_file)
+        
+        # Save objective progression (standalone)
+        objective_file = os.path.join(output_dir, f"objective_progression_lambda{optimal_lambda:.0f}_mu{optimal_mu:.0f}.png")
+        placer.visualize_objective_progression(sweep_history, save_path=objective_file)
+        
+        # Save placement progression
+        placement_prog_file = os.path.join(output_dir, f"placement_evolution_lambda{optimal_lambda:.0f}_mu{optimal_mu:.0f}.png")
+        placer.visualize_placement_progression(sweep_history, save_path=placement_prog_file, num_snapshots=6)
+        
+        print(f"\n[SAVE] Results saved to: {output_dir}/")
         
     elif mode == "3":
-        # Run multiple parameter combinations
         param_combinations = [
             (10, 10), (50, 50), (100, 100), (200, 200), (500, 500), (1000, 1000)
         ]
-        print(f"\n🔄 Running {len(param_combinations)} parameter combinations...")
+        print(f"\n[INFO] Running {len(param_combinations)} parameter combinations...")
         print("   (Higher penalties enforce constraints more strongly)")
         
         results_summary = []
         for lambda_penalty, mu_penalty in param_combinations:
             print(f"\n{'='*60}")
-            print(f"Testing λ={lambda_penalty}, μ={mu_penalty}")
+            print(f"Testing lambda={lambda_penalty}, mu={mu_penalty}")
             print('='*60)
             
             X, s_vec, energy, sampleset = placer.solve_with_dwave(
@@ -757,123 +1102,110 @@ def main():
                 'energy': energy
             })
             
-            # Save visualization
             output_dir = "fpga_placement_results"
             os.makedirs(output_dir, exist_ok=True)
             output_file = os.path.join(output_dir, f"placement_lambda{lambda_penalty}_mu{mu_penalty}.png")
             placer.visualize_placement(X, 
-                title=f"λ={lambda_penalty}, μ={mu_penalty}, Valid={results['is_valid_placement']}",
+                title=f"lambda={lambda_penalty}, mu={mu_penalty}, Valid={results['is_valid_placement']}",
                 save_path=output_file)
         
-        # Print summary table
         print("\n" + "=" * 80)
         print("BATCH RESULTS SUMMARY")
         print("=" * 80)
-        print(f"{'λ':>6} {'μ':>6} {'Valid':>7} {'Objective':>12} {'C1 Viol':>10} {'C2 Viol':>10} {'Energy':>10}")
+        print(f"{'lambda':>6} {'mu':>6} {'Valid':>7} {'Objective':>12} {'C1 Viol':>10} {'C2 Viol':>10} {'Energy':>10}")
         print("-" * 80)
         for r in results_summary:
-            print(f"{r['lambda']:>6} {r['mu']:>6} {'✓' if r['valid'] else '✗':>7} "
+            print(f"{r['lambda']:>6} {r['mu']:>6} {'[OK]' if r['valid'] else '[X]':>7} "
                   f"{r['objective']:>12.2f} {r['c1_violation']:>10.4f} "
                   f"{r['c2_violation']:>10.4f} {r['energy']:>10.2f}")
         print("=" * 80)
         
-        # Find best valid solution
         valid_results = [r for r in results_summary if r['valid']]
         if valid_results:
             best = min(valid_results, key=lambda x: x['objective'])
-            print(f"\n🏆 Best valid solution: λ={best['lambda']}, μ={best['mu']}, "
+            print(f"\n[BEST] Best valid solution: lambda={best['lambda']}, mu={best['mu']}, "
                   f"objective={best['objective']:.2f}")
         else:
-            print("\n⚠️  No valid solutions found. Try increasing penalties!")
+            print(f"\n[WARNING] No valid solutions found. Try increasing penalties!")
         
-        print(f"\n📁 All results saved to: fpga_placement_results/")
+        print(f"\n[SAVE] All results saved to: fpga_placement_results/")
         
-    else:  # mode == "2"
-        # Interactive single run
-        lambda_penalty = float(input("\nEnter λ (lambda) penalty [default=10]: ") or "10")
-        mu_penalty = float(input("Enter μ (mu) penalty [default=10]: ") or "10")
+    else:
+        lambda_penalty = float(input("\nEnter lambda (lambda) penalty [default=100]: ") or "100")
+        mu_penalty = float(input("Enter mu (mu) penalty [default=100]: ") or "100")
         use_dwave = input("Use D-Wave quantum annealer? (y/n) [default=n]: ").lower() == 'y'
         
-        print(f"\n🎯 Solving with λ={lambda_penalty}, μ={mu_penalty}...")
+        print(f"\n[INFO] Solving with lambda={lambda_penalty}, mu={mu_penalty}...")
         
-        # Solve
         X, s_vec, energy, sampleset = placer.solve_with_dwave(
             lambda_penalty, mu_penalty, 
             use_sampler=use_dwave,
             num_reads=100
         )
         
-        # Analyze solution diversity (QA gives multiple solutions)
-        top_solutions, top_energies = placer.analyze_solution_diversity(sampleset, top_k=10)
+        results = placer.evaluate_solution(X, s_vec)
         
-        # Evaluate
         print("\n" + "=" * 60)
         print("RESULTS")
         print("=" * 60)
-        results = placer.evaluate_solution(X, s_vec)
+        print(f"\n[INFO] Valid Placement: {results['is_valid_placement']}")
+        print(f"[INFO] Objective (wirelength): {results['objective']:.2f}")
+        print(f"[INFO] Constraint 1 violation: {results['constraint1_violation']:.4f}")
+        print(f"[INFO] Constraint 2 violation: {results['constraint2_violation']:.4f}")
+        print(f"[INFO] QUBO Energy: {energy:.2f}")
         
-        print(f"\n✅ Valid Placement: {results['is_valid_placement']}")
-        print(f"📏 Objective (wirelength): {results['objective']:.2f}")
-        print(f"⚠️  Constraint 1 violation: {results['constraint1_violation']:.4f}")
-        print(f"⚠️  Constraint 2 violation: {results['constraint2_violation']:.4f}")
-        print(f"🔋 QUBO Energy: {energy:.2f}")
+        print(f"\n[INFO] Row sums (should be all 1s): {results['row_sums']}")
+        print(f"[INFO] Col sums (should be <= 1): {results['col_sums']}")
         
-        print(f"\n📊 Row sums (should be all 1s): {results['row_sums']}")
-        print(f"📊 Col sums (should be ≤ 1): {results['col_sums']}")
-        
-        # Detailed violation analysis
         if len(results['blocks_not_placed_once']) > 0:
-            print(f"\n❌ Blocks not placed exactly once: {results['blocks_not_placed_once'].tolist()}")
+            print(f"\n[ERROR] Blocks not placed exactly once: {results['blocks_not_placed_once'].tolist()}")
             for block_id in results['blocks_not_placed_once']:
                 count = results['row_sums'][block_id]
                 print(f"   Block {block_id}: placed {count} times")
         
         if len(results['locations_with_overlap']) > 0:
-            print(f"\n❌ Locations with overlapping blocks: {results['locations_with_overlap'].tolist()}")
+            print(f"\n[ERROR] Locations with overlapping blocks: {results['locations_with_overlap'].tolist()}")
             for loc_id in results['locations_with_overlap']:
                 count = results['col_sums'][loc_id]
                 blocks_here = np.where(X[:, loc_id] == 1)[0]
-                print(f"   Location {loc_id}: {int(count)} blocks → {blocks_here.tolist()}")
+                print(f"   Location {loc_id}: {int(count)} blocks -> {blocks_here.tolist()}")
         
-        print(f"\n📊 Slack variables s: {results['s_values']}")
+        print(f"\n[INFO] Slack variables s: {results['s_values']}")
         
-        # Show placement matrix
-        print("\n📋 Placement Matrix X (blocks × locations):")
+        print("\n[INFO] Placement Matrix X (blocks x locations):")
         print("  (1 means block i is placed at location j)")
         print(X)
         
-        # Visualize
         output_dir = "fpga_placement_results"
         os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, f"placement_lambda{lambda_penalty}_mu{mu_penalty}.png")
         
         placer.visualize_placement(
             X, 
-            title=f"λ={lambda_penalty}, μ={mu_penalty}, Valid={results['is_valid_placement']}",
+            title=f"lambda={lambda_penalty}, mu={mu_penalty}, Valid={results['is_valid_placement']}",
             save_path=output_file
         )
         
-        print(f"\n📁 Results saved to: {output_dir}/")
+        print(f"\n[SAVE] Results saved to: {output_dir}/")
         print(f"   - {output_file}")
         
-        # Tuning suggestions
         print("\n" + "=" * 60)
         print("TUNING SUGGESTIONS")
         print("=" * 60)
         if results['is_valid_placement']:
-            print("✅ Placement is valid! Try reducing penalties to minimize objective.")
+            print("[OK] Placement is valid! Try reducing penalties to minimize objective.")
         else:
-            print("❌ Invalid placement detected!")
+            print("[ERROR] Invalid placement detected!")
             if results['constraint1_violation'] > 0.1:
-                print(f"⚠️  Blocks not placed exactly once!")
-                print(f"    → Increase λ (currently {lambda_penalty}) to {lambda_penalty * 5}")
+                print(f"[WARNING] Blocks not placed exactly once!")
+                print(f"    -> Increase lambda (currently {lambda_penalty}) to {lambda_penalty * 5}")
             if results['constraint2_violation'] > 0.1:
-                print(f"⚠️  Multiple blocks at same location!")
-                print(f"    → Increase μ (currently {mu_penalty}) to {mu_penalty * 5}")
+                print(f"[WARNING] Multiple blocks at same location!")
+                print(f"    -> Increase mu (currently {mu_penalty}) to {mu_penalty * 5}")
             if len(results['locations_with_overlap']) > 0:
-                print(f"\n💡 TIP: The penalties need to be MUCH larger than the objective.")
+                print(f"\n[TIP] The penalties need to be MUCH larger than the objective.")
                 print(f"    Current objective: {results['objective']:.2f}")
-                print(f"    Try λ={max(500, int(results['objective'] * 10))}, μ={max(500, int(results['objective'] * 10))}")
+                print(f"    Try lambda={max(500, int(results['objective'] * 10))}, mu={max(500, int(results['objective'] * 10))}")
         print("=" * 60)
 
 
