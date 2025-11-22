@@ -913,7 +913,7 @@ class FPGAPlacementQUBO:
         print(f"   Phase 1 point: lambda={phase1_lambda:.1f}, mu={phase1_mu:.1f}, obj={phase1_loss:.2f}")
         print(f"   Recovery point: lambda={recovery_lambda:.1f}, mu={recovery_mu:.1f}, obj={recovery_loss:.2f}")
         
-        num_sweep_points = 10
+        num_sweep_points = 100
         
         best_sweep_lambda = valid_lambda
         best_sweep_mu = valid_mu
